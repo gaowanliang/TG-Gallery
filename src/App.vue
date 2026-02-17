@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, watch } from 'vue';
+import { ref, onMounted, watch, provide } from 'vue';
 import Login from './components/Login.vue';
 import Gallery from './components/Gallery.vue';
 
@@ -13,6 +13,10 @@ function onLogin() {
 function toggleTheme() {
   theme.value = theme.value === 'light' ? 'dark' : 'light';
 }
+
+// 提供给子组件使用的 theme/ref 和 切换方法（在 setup 阶段）
+provide('theme', theme);
+provide('toggleTheme', toggleTheme);
 
 // 应用主题
 onMounted(() => {
@@ -28,15 +32,7 @@ watch(theme, (newTheme) => {
 
 <template>
   <div id="app">
-    <!-- 主题切换按钮 -->
-    <button 
-      v-if="token"
-      class="theme-toggle"
-      @click="toggleTheme"
-      :title="theme === 'light' ? '切换到深色模式' : '切换到亮色模式'"
-    >
-      {{ theme === 'light' ? '🌙' : '☀️' }}
-    </button>
+    <!-- 主题切换改为放到导航栏 -->
 
     <transition name="fade" mode="out-in">
       <Gallery v-if="token" key="gallery" />

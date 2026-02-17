@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed } from "vue";
+import { ref, onMounted, onUnmounted, computed, inject } from "vue";
 import ImageDetail from "./ImageDetail.vue";
 
 const token = localStorage.getItem("gallery_token");
@@ -7,6 +7,78 @@ const entries = ref([]);
 const loading = ref(false);
 const error = ref("");
 const selectedIndex = ref(-1);
+let pollTimer = null;
+
+// 从 App 提供的 theme 注入
+const theme = inject('theme', ref('light'));
+const toggleTheme = inject('toggleTheme', null);
+
+// 删除模态与提示
+const showDeleteModal = ref(false);
+const pendingDelete = ref(null);
+const toastMessage = ref('');
+const showToast = ref(false);
+
+function openDeleteModal(entry) {
+  pendingDelete.value = entry;
+  showDeleteModal.value = true;
+}
+
+function cancelDelete() {
+  pendingDelete.value = null;
+  showDeleteModal.value = false;
+}
+
+async function performDelete() {
+  const entry = pendingDelete.value;
+  if (!entry || !entry.id) return;
+  showDeleteModal.value = false;
+  try {
+    const resp = await fetch('/api/gallery', {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({ id: entry.id })
+    });
+
+    if (!resp.ok) {
+      const j = await resp.json();
+      throw new Error(j.error || '删除失败');
+    }
+
+    // 更新本地数据与缓存
+    entries.value = entries.value.filter(e => e.id !== entry.id);
+    const cached = getGalleryListCache() || [];
+    const updated = cached.filter(e => e.id !== entry.id);
+    setGalleryListCache(updated);
+
+    // 删除图片 URL 缓存（如果存在）
+    try {
+      const fileId = entry.telegram?.file_id;
+      if (fileId) {
+        const ic = getImageCache();
+        if (ic[fileId]) {
+          delete ic[fileId];
+          localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(ic));
+        }
+      }
+    } catch (e) { /* ignore */ }
+
+    // show toast
+    toastMessage.value = '已删除';
+    showToast.value = true;
+    setTimeout(() => { showToast.value = false; toastMessage.value = ''; }, 2500);
+  } catch (e) {
+    console.error('Delete failed', e);
+    toastMessage.value = '删除失败: ' + String(e.message || e);
+    showToast.value = true;
+    setTimeout(() => { showToast.value = false; toastMessage.value = ''; }, 3500);
+  } finally {
+    pendingDelete.value = null;
+  }
+}
 
 // 图片缓存管理（永久缓存）
 const IMAGE_CACHE_KEY = 'gallery_image_cache';
@@ -49,11 +121,11 @@ function setGalleryListCache(list) {
 }
 
 // 加载图片数据（优化：先显示缓存，再异步更新）
-async function load(forceRefresh = false) {
+async function load(forceImageRefresh = false, forceListRefresh = false) {
   error.value = "";
   
   // 第一步：立即从缓存加载并显示
-  if (!forceRefresh) {
+  if (!forceListRefresh) {
     const cachedList = getGalleryListCache();
     if (cachedList && cachedList.length > 0) {
       const imageCache = getImageCache();
@@ -71,7 +143,10 @@ async function load(forceRefresh = false) {
       loading.value = true;
     }
   } else {
-    loading.value = true;
+    // 背景轮询：仅当当前没有任何条目时显示加载指示，避免刷新时的闪烁
+    if (entries.value.length === 0) {
+      loading.value = true;
+    }
   }
   
   // 第二步：异步从服务器获取最新数据
@@ -90,7 +165,7 @@ async function load(forceRefresh = false) {
     // 缓存最新的画廊列表
     setGalleryListCache(serverList);
     
-    const imageCache = forceRefresh ? {} : getImageCache();
+    const imageCache = forceImageRefresh ? {} : getImageCache();
     
     // 合并服务器数据和当前数据
     const existingIds = new Set(entries.value.map(e => e.id));
@@ -102,18 +177,26 @@ async function load(forceRefresh = false) {
       
       const entry = {
         ...e,
-        src: cachedData && !forceRefresh ? cachedData.url : null,
-        loading: !cachedData || forceRefresh
+        src: cachedData && !forceImageRefresh ? cachedData.url : null,
+        loading: !cachedData || forceImageRefresh
       };
       
       // 如果是新图片，添加到列表前面
       if (!existingIds.has(e.id)) {
         newEntries.unshift(entry);
       } else {
-        // 更新现有图片的元数据
+        // 更新现有图片的元数据，但保留已有的 src/loading（除非强制刷新图片）
         const idx = entries.value.findIndex(ex => ex.id === e.id);
         if (idx !== -1) {
-          entries.value[idx] = entry;
+          const existing = entries.value[idx];
+          entries.value[idx] = {
+            ...existing,
+            ...entry,
+            // 保留已有 src，除非我们强制刷新图片 URL
+            src: existing.src && !forceImageRefresh ? existing.src : entry.src,
+            // 保留 loading 状态，除非强制刷新
+            loading: forceImageRefresh ? entry.loading : (existing.loading || entry.loading)
+          };
         }
       }
     });
@@ -125,7 +208,7 @@ async function load(forceRefresh = false) {
 
     // 加载未缓存的图片URL
     entries.value.forEach(async (e) => {
-      if (!e.telegram?.file_id || (e.src && !forceRefresh)) return;
+      if (!e.telegram?.file_id || (e.src && !forceImageRefresh)) return;
       
       try {
         const r = await fetch(
@@ -174,9 +257,57 @@ async function refreshSingleImage(entry) {
   }
 }
 
+// 删除图片（从数据库删除）
+async function deleteImage(entry) {
+  if (!entry || !entry.id) return;
+  const ok = window.confirm('确定要删除这张图片吗？此操作不可恢复。');
+  if (!ok) return;
+
+  try {
+    const resp = await fetch('/api/gallery', {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({ id: entry.id })
+    });
+
+    if (!resp.ok) {
+      const j = await resp.json();
+      throw new Error(j.error || '删除失败');
+    }
+
+    const j = await resp.json();
+    // 从本地列表和缓存移除
+    entries.value = entries.value.filter(e => e.id !== entry.id);
+    const cached = getGalleryListCache() || [];
+    const updated = cached.filter(e => e.id !== entry.id);
+    setGalleryListCache(updated);
+
+    // 删除图片 URL 缓存（如果存在）
+    try {
+      const fileId = entry.telegram?.file_id;
+      if (fileId) {
+        const ic = getImageCache();
+        if (ic[fileId]) {
+          delete ic[fileId];
+          localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(ic));
+        }
+      }
+    } catch (e) { /* ignore */ }
+
+    alert('删除成功');
+  } catch (e) {
+    console.error('Delete failed', e);
+    alert('删除失败: ' + String(e));
+  }
+}
+
 // 全部强制刷新
 function forceRefreshAll() {
-  load(true);
+  // 从数据库刷新画廊列表（不强制刷新图片 URL）
+  load(false, true);
 }
 
 function open(entry) {
@@ -332,6 +463,19 @@ onMounted(() => {
   load();
   updateColumnCount();
   window.addEventListener('resize', updateColumnCount);
+
+  // 每 60 秒轮询服务器，合并新图片列表（从数据库刷新列表，不强制刷新图片 URL）
+  pollTimer = setInterval(() => {
+    load(false, true);
+  }, 60000);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('resize', updateColumnCount);
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
 });
 </script>
 
@@ -339,16 +483,54 @@ onMounted(() => {
   <div class="gallery-page">
     <!-- 导航栏 -->
     <nav class="navbar">
-      <div class="container">
+          <div class="container">
         <h1 class="navbar-brand">图床</h1>
         <div class="navbar-actions">
           <button @click="forceRefreshAll" class="btn btn-outline-secondary btn-sm">
             <span>🔄</span> 刷新全部
           </button>
+          <button 
+            v-if="toggleTheme" 
+            @click="toggleTheme()" 
+            class="btn btn-outline-secondary btn-sm"
+            :title="theme === 'light' ? '切换到深色模式' : '切换到亮色模式'"
+          >
+            {{ theme === 'light' ? '🌙' : '☀️' }}
+          </button>
+
+          <button 
+            v-if="selectedIndex >= 0" 
+            @click="refreshSingleImage(entries[selectedIndex])" 
+            class="btn btn-outline-secondary btn-sm"
+            title="刷新当前图片"
+          >
+            🔄 当前
+          </button>
+
           <button @click="logout" class="btn btn-outline-secondary btn-sm">登出</button>
-        </div>
+          </div>
       </div>
     </nav>
+
+      <!-- 删除确认模态 -->
+      <div v-if="showDeleteModal" class="modal-backdrop" @click.self="cancelDelete">
+        <div class="modal-card">
+          <div class="modal-header">
+            <h3>确认删除</h3>
+          </div>
+          <div class="modal-body">
+            <p>确定要删除这张图片吗？此操作不可恢复。</p>
+            <p v-if="pendingDelete?.prompt" class="muted small">{{ pendingDelete.prompt }}</p>
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-secondary" @click="cancelDelete">取消</button>
+            <button class="btn btn-danger" @click="performDelete">删除</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 顶部短提示 (toast) -->
+      <div v-if="showToast" class="top-toast">{{ toastMessage }}</div>
 
     <div class="container">
       <!-- 加载状态 -->
@@ -390,13 +572,13 @@ onMounted(() => {
                 <div class="mini-spinner"></div>
               </div>
               
-              <!-- 刷新按钮 -->
+              <!-- 删除按钮 -->
               <button 
                 class="refresh-btn" 
-                @click.stop="refreshSingleImage(entry)"
-                title="刷新此图片"
+                @click.stop="openDeleteModal(entry)"
+                title="删除此图片"
               >
-                🔄
+                🗑️
               </button>
             </div>
 
@@ -611,6 +793,49 @@ onMounted(() => {
 
 .refresh-btn:hover {
   background: var(--bg-tertiary);
+}
+
+/* Modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(10,10,10,0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+.modal-card {
+  width: 90%;
+  max-width: 520px;
+  background: var(--bg-primary);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(2,6,23,0.6);
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+}
+.modal-header {
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border-color);
+}
+.modal-header h3 { margin: 0; }
+.modal-body { padding: 1rem 1.25rem; color: var(--text-primary); }
+.modal-actions { padding: 0.75rem 1.25rem; display:flex; gap:0.5rem; justify-content:flex-end; }
+.btn-danger { background: #ef4444; color: white; border: none; padding: 0.6rem 1rem; border-radius: 8px; cursor: pointer; }
+.btn-secondary { background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border-color); padding: 0.5rem 0.9rem; border-radius: 8px; cursor: pointer; }
+
+/* Top toast */
+.top-toast {
+  position: fixed;
+  top: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: linear-gradient(90deg,var(--primary),var(--primary-hover));
+  color: white;
+  padding: 0.6rem 1rem;
+  border-radius: 999px;
+  z-index: 2100;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.35);
 }
 
 /* 卡片主体 */
