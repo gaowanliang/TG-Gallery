@@ -310,6 +310,32 @@ function forceRefreshAll() {
   load(false, true);
 }
 
+async function clearImageCache() {
+  const ok = window.confirm('确定要清除图片缓存吗？清除后会重新加载图片。');
+  if (!ok) return;
+
+  try {
+    localStorage.removeItem(IMAGE_CACHE_KEY);
+
+    entries.value = entries.value.map((entry) => ({
+      ...entry,
+      src: null,
+      loading: Boolean(entry.telegram?.file_id)
+    }));
+
+    toastMessage.value = '图片缓存已清除，正在重新加载';
+    showToast.value = true;
+    setTimeout(() => { showToast.value = false; toastMessage.value = ''; }, 2500);
+
+    await load(true, false);
+  } catch (e) {
+    console.error('Failed to clear image cache:', e);
+    toastMessage.value = '清除图片缓存失败: ' + String(e.message || e);
+    showToast.value = true;
+    setTimeout(() => { showToast.value = false; toastMessage.value = ''; }, 3500);
+  }
+}
+
 function open(entry) {
   const index = entries.value.findIndex(e => e.id === entry.id);
   selectedIndex.value = index;
@@ -488,6 +514,13 @@ onUnmounted(() => {
         <div class="navbar-actions">
           <button @click="forceRefreshAll" class="btn btn-outline-secondary btn-sm">
             <span>🔄</span> 刷新全部
+          </button>
+          <button
+            @click="clearImageCache"
+            class="btn btn-outline-secondary btn-sm"
+            title="清除图片缓存并重新加载"
+          >
+            清缓存
           </button>
           <button 
             v-if="toggleTheme" 
