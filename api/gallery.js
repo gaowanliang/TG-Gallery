@@ -61,14 +61,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // GET: 返回画廊列表
-    const docs = await collection
-      .find({}, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
-      .sort({ timestamp: -1 })
-      .limit(200)
-      .toArray();
-
-    const out = docs.map((d) => ({
+    const toGalleryItem = (d) => ({
       id: d._id.toString(),
       prompt: d.prompt,
       metadata: d.metadata || {},
@@ -77,7 +70,59 @@ export default async function handler(req, res) {
         file_id: d.telegram?.file_id || null,
       },
       timestamp: d.timestamp,
-    }));
+    });
+
+    // GET: 返回画廊列表（兼容旧版 + 新版游标分页）
+    const limitRaw = req.query?.limit;
+    const cursorRaw = req.query?.cursor;
+    const cursor = typeof cursorRaw === 'string' ? cursorRaw.trim() : '';
+    const wantsPagination = typeof limitRaw !== 'undefined' || Boolean(cursor);
+
+    if (wantsPagination) {
+      const parsedLimit = Number.parseInt(String(limitRaw ?? ''), 10);
+      const limit = Number.isFinite(parsedLimit)
+        ? Math.max(1, Math.min(parsedLimit, 200))
+        : 60;
+
+      let query = {};
+      if (cursor) {
+        if (!ObjectId.isValid(cursor)) {
+          res.statusCode = 400;
+          return res.end(JSON.stringify({ error: 'Invalid cursor' }));
+        }
+        query = { _id: { $lt: new ObjectId(cursor) } };
+      }
+
+      const docs = await collection
+        .find(query, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
+        .sort({ _id: -1 })
+        .limit(limit + 1)
+        .toArray();
+
+      const hasMore = docs.length > limit;
+      const pageDocs = hasMore ? docs.slice(0, limit) : docs;
+      const items = pageDocs.map(toGalleryItem);
+      const nextCursor = hasMore && pageDocs.length > 0
+        ? pageDocs[pageDocs.length - 1]._id.toString()
+        : null;
+
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify({
+        items,
+        hasMore,
+        nextCursor,
+        limit,
+      }));
+    }
+
+    // 旧版行为：仍然一次返回最多 200 条
+    const docs = await collection
+      .find({}, { projection: { prompt: 1, metadata: 1, telegram: 1, timestamp: 1 } })
+      .sort({ timestamp: -1 })
+      .limit(200)
+      .toArray();
+
+    const out = docs.map(toGalleryItem);
     res.setHeader('Content-Type', 'application/json');
     return res.end(JSON.stringify(out));
   } catch (e) {

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed, inject } from "vue";
+import { ref, onMounted, onUnmounted, computed, inject, nextTick } from "vue";
 import ImageDetail from "./ImageDetail.vue";
 
 const token = localStorage.getItem("gallery_token");
@@ -8,6 +8,13 @@ const loading = ref(false);
 const error = ref("");
 const selectedIndex = ref(-1);
 let pollTimer = null;
+let loadMoreObserver = null;
+const loadMoreAnchor = ref(null);
+const loadingMore = ref(false);
+const hasMore = ref(true);
+const paginationCursor = ref(null);
+const PAGE_SIZE = 60;
+const pendingImageLoads = new Set();
 
 // 从 App 提供的 theme 注入
 const theme = inject('theme', ref('light'));
@@ -18,6 +25,60 @@ const showDeleteModal = ref(false);
 const pendingDelete = ref(null);
 const toastMessage = ref('');
 const showToast = ref(false);
+const batchMode = ref(false);
+const selectedEntryIds = ref([]);
+const pendingDeleteIds = new Set();
+const selectedCount = computed(() => selectedEntryIds.value.length);
+const allEntriesSelected = computed(() => (
+  entries.value.length > 0 && selectedEntryIds.value.length === entries.value.length
+));
+
+function showToastMsg(message, duration = 2500) {
+  toastMessage.value = message;
+  showToast.value = true;
+  setTimeout(() => {
+    showToast.value = false;
+    toastMessage.value = '';
+  }, duration);
+}
+
+function syncSelectionWithEntries() {
+  const visibleIds = new Set(entries.value.map((entry) => entry.id));
+  selectedEntryIds.value = selectedEntryIds.value.filter((id) => visibleIds.has(id));
+}
+
+function toggleBatchMode() {
+  batchMode.value = !batchMode.value;
+  selectedIndex.value = -1;
+  if (!batchMode.value) {
+    selectedEntryIds.value = [];
+  }
+}
+
+function isEntrySelected(entryId) {
+  return selectedEntryIds.value.includes(entryId);
+}
+
+function toggleEntrySelection(entryId) {
+  if (!entryId) return;
+  if (isEntrySelected(entryId)) {
+    selectedEntryIds.value = selectedEntryIds.value.filter((id) => id !== entryId);
+  } else {
+    selectedEntryIds.value = [...selectedEntryIds.value, entryId];
+  }
+}
+
+function clearBatchSelection() {
+  selectedEntryIds.value = [];
+}
+
+function toggleSelectAllEntries() {
+  if (allEntriesSelected.value) {
+    clearBatchSelection();
+    return;
+  }
+  selectedEntryIds.value = entries.value.map((entry) => entry.id);
+}
 
 function openDeleteModal(entry) {
   pendingDelete.value = entry;
@@ -33,50 +94,59 @@ async function performDelete() {
   const entry = pendingDelete.value;
   if (!entry || !entry.id) return;
   showDeleteModal.value = false;
+
+  const snapshot = hideEntryOptimistically(entry.id);
+
   try {
-    const resp = await fetch('/api/gallery', {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
-      body: JSON.stringify({ id: entry.id })
-    });
-
-    if (!resp.ok) {
-      const j = await resp.json();
-      throw new Error(j.error || '删除失败');
-    }
-
-    // 更新本地数据与缓存
-    entries.value = entries.value.filter(e => e.id !== entry.id);
-    const cached = getGalleryListCache() || [];
-    const updated = cached.filter(e => e.id !== entry.id);
-    setGalleryListCache(updated);
-
-    // 删除图片 URL 缓存（如果存在）
-    try {
-      const fileId = entry.telegram?.file_id;
-      if (fileId) {
-        const ic = getImageCache();
-        if (ic[fileId]) {
-          delete ic[fileId];
-          localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(ic));
-        }
-      }
-    } catch (e) { /* ignore */ }
-
-    // show toast
-    toastMessage.value = '已删除';
-    showToast.value = true;
-    setTimeout(() => { showToast.value = false; toastMessage.value = ''; }, 2500);
+    await requestDeleteById(entry.id);
+    finalizeDeleteSuccess(entry);
+    showToastMsg('已删除');
   } catch (e) {
     console.error('Delete failed', e);
-    toastMessage.value = '删除失败: ' + String(e.message || e);
-    showToast.value = true;
-    setTimeout(() => { showToast.value = false; toastMessage.value = ''; }, 3500);
+    restoreHiddenEntry(snapshot);
+    showToastMsg('删除失败: ' + String(e.message || e), 3500);
   } finally {
     pendingDelete.value = null;
+  }
+}
+
+async function performBatchDelete() {
+  const targetEntries = entries.value.filter((entry) => selectedEntryIds.value.includes(entry.id));
+  if (targetEntries.length === 0) {
+    showToastMsg('请先选择要删除的图片');
+    return;
+  }
+
+  const ok = window.confirm(`确定要删除选中的 ${targetEntries.length} 张图片吗？此操作不可恢复。`);
+  if (!ok) return;
+
+  const targets = targetEntries.map((entry) => ({
+    entry,
+    snapshot: hideEntryOptimistically(entry.id)
+  }));
+
+  selectedEntryIds.value = [];
+  batchMode.value = false;
+
+  let successCount = 0;
+  let failCount = 0;
+
+  for (const target of targets) {
+    try {
+      await requestDeleteById(target.entry.id);
+      finalizeDeleteSuccess(target.entry);
+      successCount += 1;
+    } catch (e) {
+      console.error('Batch delete failed', e);
+      restoreHiddenEntry(target.snapshot);
+      failCount += 1;
+    }
+  }
+
+  if (failCount === 0) {
+    showToastMsg(`已删除 ${successCount} 张图片`);
+  } else {
+    showToastMsg(`已删除 ${successCount} 张，${failCount} 张删除失败`, 3500);
   }
 }
 
@@ -114,124 +184,311 @@ function getGalleryListCache() {
 
 function setGalleryListCache(list) {
   try {
-    localStorage.setItem(GALLERY_LIST_CACHE_KEY, JSON.stringify(list));
+    // 仅缓存首屏，避免本地缓存过大
+    const topList = Array.isArray(list) ? list.slice(0, PAGE_SIZE) : [];
+    localStorage.setItem(GALLERY_LIST_CACHE_KEY, JSON.stringify(topList));
   } catch (e) {
     console.error('Failed to cache gallery list:', e);
   }
 }
 
+function removeEntryFromLocalCache(entry) {
+  const cached = getGalleryListCache() || [];
+  setGalleryListCache(cached.filter((item) => item.id !== entry.id));
+
+  try {
+    const fileId = entry.telegram?.file_id;
+    if (!fileId) return;
+    const imageCache = getImageCache();
+    if (imageCache[fileId]) {
+      delete imageCache[fileId];
+      localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(imageCache));
+    }
+  } catch (e) {
+    // ignore cache cleanup errors
+  }
+}
+
+function hideEntryOptimistically(entryId) {
+  const index = entries.value.findIndex((entry) => entry.id === entryId);
+  if (index < 0) return null;
+
+  const [entry] = entries.value.splice(index, 1);
+
+  if (selectedIndex.value === index) {
+    selectedIndex.value = -1;
+  } else if (selectedIndex.value > index) {
+    selectedIndex.value -= 1;
+  }
+
+  pendingDeleteIds.add(entryId);
+  syncSelectionWithEntries();
+  return { entry, index };
+}
+
+function restoreHiddenEntry(snapshot) {
+  if (!snapshot || !snapshot.entry) return;
+
+  pendingDeleteIds.delete(snapshot.entry.id);
+  if (entries.value.some((entry) => entry.id === snapshot.entry.id)) return;
+
+  const insertIndex = Math.min(snapshot.index, entries.value.length);
+  entries.value.splice(insertIndex, 0, snapshot.entry);
+
+  if (selectedIndex.value >= insertIndex) {
+    selectedIndex.value += 1;
+  }
+  syncSelectionWithEntries();
+}
+
+function finalizeDeleteSuccess(entry) {
+  pendingDeleteIds.delete(entry.id);
+  removeEntryFromLocalCache(entry);
+  syncSelectionWithEntries();
+}
+
+async function requestDeleteById(entryId) {
+  const resp = await fetch('/api/gallery', {
+    method: 'DELETE',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({ id: entryId })
+  });
+
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch (e) {
+    body = null;
+  }
+
+  if (!resp.ok) {
+    throw new Error(body?.error || '删除失败');
+  }
+
+  return body;
+}
+
+function buildEntryWithCache(entry, existingEntry, imageCache, forceImageRefresh = false) {
+  const fileId = entry.telegram?.file_id;
+  const cachedData = fileId && imageCache[fileId];
+  const keepExistingSrc = Boolean(existingEntry?.src) && !forceImageRefresh;
+
+  let loadingState = false;
+  if (forceImageRefresh) {
+    loadingState = Boolean(fileId);
+  } else if (keepExistingSrc) {
+    loadingState = false;
+  } else if (existingEntry?.loading && !cachedData) {
+    loadingState = true;
+  } else {
+    loadingState = Boolean(fileId) && !cachedData;
+  }
+
+  return {
+    ...existingEntry,
+    ...entry,
+    src: keepExistingSrc ? existingEntry.src : (cachedData && !forceImageRefresh ? cachedData.url : null),
+    loading: loadingState,
+  };
+}
+
+async function fetchGalleryPage(cursor = null, limit = PAGE_SIZE) {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  if (cursor) params.set('cursor', cursor);
+
+  const resp = await fetch(`/api/gallery?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch (e) {
+    body = null;
+  }
+
+  if (!resp.ok) {
+    throw new Error(body?.error || 'Failed to load');
+  }
+
+  // 兼容后端旧版（数组）
+  if (Array.isArray(body)) {
+    const items = body;
+    return {
+      items,
+      hasMore: items.length >= limit,
+      nextCursor: items.length > 0 ? items[items.length - 1].id : null,
+    };
+  }
+
+  return {
+    items: Array.isArray(body?.items) ? body.items : [],
+    hasMore: Boolean(body?.hasMore),
+    nextCursor: body?.nextCursor || null,
+  };
+}
+
+async function loadEntryImage(entry) {
+  const fileId = entry.telegram?.file_id;
+  if (!fileId) return;
+  if (entry.src && !entry.loading) return;
+  if (pendingImageLoads.has(fileId)) return;
+
+  pendingImageLoads.add(fileId);
+  try {
+    const r = await fetch(`/api/fileurl?file_id=${encodeURIComponent(fileId)}`);
+    if (!r.ok) {
+      entry.loading = false;
+      return;
+    }
+    const j = await r.json();
+    entry.src = j.url;
+    entry.loading = false;
+    setImageCache(fileId, j.url);
+  } catch (err) {
+    console.error('Failed to load image:', err);
+    entry.loading = false;
+  } finally {
+    pendingImageLoads.delete(fileId);
+  }
+}
+
+function queueImageLoads(targetEntries) {
+  targetEntries.forEach((entry) => {
+    if (!entry.telegram?.file_id) return;
+    if (entry.src && !entry.loading) return;
+    void loadEntryImage(entry);
+  });
+}
+
+function mergeTopPage(serverItems, forceImageRefresh = false, keepExistingTail = false) {
+  const visibleServerList = serverItems.filter((e) => !pendingDeleteIds.has(e.id));
+  const imageCache = forceImageRefresh ? {} : getImageCache();
+  const existingById = new Map(entries.value.map((entry) => [entry.id, entry]));
+  const topEntries = visibleServerList.map((entry) =>
+    buildEntryWithCache(entry, existingById.get(entry.id), imageCache, forceImageRefresh)
+  );
+
+  if (keepExistingTail) {
+    const topIds = new Set(topEntries.map((entry) => entry.id));
+    const tail = entries.value.filter((entry) => !topIds.has(entry.id));
+    entries.value = [...topEntries, ...tail];
+  } else {
+    entries.value = topEntries;
+  }
+
+  setGalleryListCache(visibleServerList);
+  queueImageLoads(entries.value);
+  syncSelectionWithEntries();
+}
+
 // 加载图片数据（优化：先显示缓存，再异步更新）
 async function load(forceImageRefresh = false, forceListRefresh = false) {
   error.value = "";
-  
-  // 第一步：立即从缓存加载并显示
+  const hadEntries = entries.value.length > 0;
+
   if (!forceListRefresh) {
     const cachedList = getGalleryListCache();
     if (cachedList && cachedList.length > 0) {
-      const imageCache = getImageCache();
-      entries.value = cachedList.map((e) => {
-        const fileId = e.telegram?.file_id;
-        const cachedUrl = fileId && imageCache[fileId];
-        return {
-          ...e,
-          src: cachedUrl ? cachedUrl.url : null,
-          loading: !cachedUrl
-        };
-      });
+      const visibleCachedList = cachedList
+        .slice(0, PAGE_SIZE)
+        .filter((e) => !pendingDeleteIds.has(e.id));
+      const imageCache = forceImageRefresh ? {} : getImageCache();
+      entries.value = visibleCachedList.map((entry) =>
+        buildEntryWithCache(entry, null, imageCache, forceImageRefresh)
+      );
+      queueImageLoads(entries.value);
       loading.value = false;
     } else {
       loading.value = true;
     }
-  } else {
+  } else if (!hadEntries) {
     // 背景轮询：仅当当前没有任何条目时显示加载指示，避免刷新时的闪烁
-    if (entries.value.length === 0) {
-      loading.value = true;
-    }
+    loading.value = true;
   }
-  
-  // 第二步：异步从服务器获取最新数据
-  try {
-    const resp = await fetch("/api/gallery", {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    
-    if (!resp.ok) {
-      const j = await resp.json();
-      throw new Error(j.error || "Failed to load");
-    }
-    
-    const serverList = await resp.json();
-    
-    // 缓存最新的画廊列表
-    setGalleryListCache(serverList);
-    
-    const imageCache = forceImageRefresh ? {} : getImageCache();
-    
-    // 合并服务器数据和当前数据
-    const existingIds = new Set(entries.value.map(e => e.id));
-    const newEntries = [];
-    
-    serverList.forEach((e) => {
-      const fileId = e.telegram?.file_id;
-      const cachedData = fileId && imageCache[fileId];
-      
-      const entry = {
-        ...e,
-        src: cachedData && !forceImageRefresh ? cachedData.url : null,
-        loading: !cachedData || forceImageRefresh
-      };
-      
-      // 如果是新图片，添加到列表前面
-      if (!existingIds.has(e.id)) {
-        newEntries.unshift(entry);
-      } else {
-        // 更新现有图片的元数据，但保留已有的 src/loading（除非强制刷新图片）
-        const idx = entries.value.findIndex(ex => ex.id === e.id);
-        if (idx !== -1) {
-          const existing = entries.value[idx];
-          entries.value[idx] = {
-            ...existing,
-            ...entry,
-            // 保留已有 src，除非我们强制刷新图片 URL
-            src: existing.src && !forceImageRefresh ? existing.src : entry.src,
-            // 保留 loading 状态，除非强制刷新
-            loading: forceImageRefresh ? entry.loading : (existing.loading || entry.loading)
-          };
-        }
-      }
-    });
-    
-    // 将新图片添加到列表开头
-    if (newEntries.length > 0) {
-      entries.value = [...newEntries, ...entries.value];
-    }
 
-    // 加载未缓存的图片URL
-    entries.value.forEach(async (e) => {
-      if (!e.telegram?.file_id || (e.src && !forceImageRefresh)) return;
-      
-      try {
-        const r = await fetch(
-          `/api/fileurl?file_id=${encodeURIComponent(e.telegram.file_id)}`
-        );
-        if (!r.ok) return;
-        
-        const j = await r.json();
-        e.src = j.url;
-        e.loading = false;
-        
-        // 永久缓存图片 URL
-        setImageCache(e.telegram.file_id, j.url);
-      } catch (err) {
-        console.error('Failed to load image:', err);
-        e.loading = false;
-      }
-    });
+  try {
+    const page = await fetchGalleryPage(null, PAGE_SIZE);
+    mergeTopPage(page.items, forceImageRefresh, forceListRefresh);
+
+    // 首次加载/重置时，更新分页游标；后台刷新时保留现有游标，避免打断下滑连续加载。
+    if (!forceListRefresh || !hadEntries) {
+      paginationCursor.value = page.nextCursor;
+      hasMore.value = page.hasMore;
+    } else if (!paginationCursor.value) {
+      paginationCursor.value = page.nextCursor;
+    }
   } catch (e) {
     error.value = String(e);
   } finally {
     loading.value = false;
+    if (!loadMoreObserver) {
+      nextTick(() => {
+        setupLoadMoreObserver();
+      });
+    }
   }
+}
+
+async function loadMore() {
+  if (loading.value || loadingMore.value) return;
+  if (!hasMore.value || !paginationCursor.value) return;
+
+  loadingMore.value = true;
+  try {
+    const page = await fetchGalleryPage(paginationCursor.value, PAGE_SIZE);
+    const visibleItems = page.items.filter((entry) => !pendingDeleteIds.has(entry.id));
+    const imageCache = getImageCache();
+    const existingIds = new Set(entries.value.map((entry) => entry.id));
+    const appendedEntries = [];
+
+    visibleItems.forEach((entry) => {
+      if (existingIds.has(entry.id)) return;
+      appendedEntries.push(buildEntryWithCache(entry, null, imageCache, false));
+      existingIds.add(entry.id);
+    });
+
+    if (appendedEntries.length > 0) {
+      entries.value = [...entries.value, ...appendedEntries];
+      queueImageLoads(appendedEntries);
+      syncSelectionWithEntries();
+    }
+
+    paginationCursor.value = page.nextCursor;
+    hasMore.value = page.hasMore;
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    loadingMore.value = false;
+  }
+}
+
+function setupLoadMoreObserver() {
+  if (typeof window === 'undefined' || !('IntersectionObserver' in window)) return;
+  if (!loadMoreAnchor.value) return;
+
+  if (loadMoreObserver) {
+    loadMoreObserver.disconnect();
+  }
+
+  loadMoreObserver = new IntersectionObserver(
+    (observedEntries) => {
+      if (observedEntries.some((item) => item.isIntersecting)) {
+        void loadMore();
+      }
+    },
+    {
+      root: null,
+      rootMargin: '600px 0px 600px 0px',
+      threshold: 0.01,
+    }
+  );
+
+  loadMoreObserver.observe(loadMoreAnchor.value);
 }
 
 // 刷新单个图片
@@ -254,53 +511,6 @@ async function refreshSingleImage(entry) {
   } catch (err) {
     console.error('Failed to refresh image:', err);
     entry.loading = false;
-  }
-}
-
-// 删除图片（从数据库删除）
-async function deleteImage(entry) {
-  if (!entry || !entry.id) return;
-  const ok = window.confirm('确定要删除这张图片吗？此操作不可恢复。');
-  if (!ok) return;
-
-  try {
-    const resp = await fetch('/api/gallery', {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
-      body: JSON.stringify({ id: entry.id })
-    });
-
-    if (!resp.ok) {
-      const j = await resp.json();
-      throw new Error(j.error || '删除失败');
-    }
-
-    const j = await resp.json();
-    // 从本地列表和缓存移除
-    entries.value = entries.value.filter(e => e.id !== entry.id);
-    const cached = getGalleryListCache() || [];
-    const updated = cached.filter(e => e.id !== entry.id);
-    setGalleryListCache(updated);
-
-    // 删除图片 URL 缓存（如果存在）
-    try {
-      const fileId = entry.telegram?.file_id;
-      if (fileId) {
-        const ic = getImageCache();
-        if (ic[fileId]) {
-          delete ic[fileId];
-          localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(ic));
-        }
-      }
-    } catch (e) { /* ignore */ }
-
-    alert('删除成功');
-  } catch (e) {
-    console.error('Delete failed', e);
-    alert('删除失败: ' + String(e));
   }
 }
 
@@ -489,6 +699,9 @@ onMounted(() => {
   load();
   updateColumnCount();
   window.addEventListener('resize', updateColumnCount);
+  nextTick(() => {
+    setupLoadMoreObserver();
+  });
 
   // 每 60 秒轮询服务器，合并新图片列表（从数据库刷新列表，不强制刷新图片 URL）
   pollTimer = setInterval(() => {
@@ -501,6 +714,10 @@ onUnmounted(() => {
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+  if (loadMoreObserver) {
+    loadMoreObserver.disconnect();
+    loadMoreObserver = null;
   }
 });
 </script>
@@ -521,6 +738,47 @@ onUnmounted(() => {
             title="清除图片缓存并重新加载"
           >
             清缓存
+          </button>
+          <button
+            v-if="!batchMode"
+            @click="toggleBatchMode"
+            class="btn btn-outline-secondary btn-sm"
+            title="开启批量删除模式"
+          >
+            批量删除
+          </button>
+          <button
+            v-else
+            @click="toggleSelectAllEntries"
+            class="btn btn-outline-secondary btn-sm"
+            :title="allEntriesSelected ? '取消全选' : '全选当前图片'"
+          >
+            {{ allEntriesSelected ? '取消全选' : '全选' }}
+          </button>
+          <button
+            v-if="batchMode"
+            @click="clearBatchSelection"
+            class="btn btn-outline-secondary btn-sm"
+            title="清空当前选择"
+          >
+            清空选择
+          </button>
+          <button
+            v-if="batchMode"
+            @click="performBatchDelete"
+            class="btn btn-danger btn-sm"
+            :disabled="selectedCount === 0"
+            title="删除选中的图片"
+          >
+            删除选中({{ selectedCount }})
+          </button>
+          <button
+            v-if="batchMode"
+            @click="toggleBatchMode"
+            class="btn btn-outline-secondary btn-sm"
+            title="退出批量删除模式"
+          >
+            退出批量
           </button>
           <button 
             v-if="toggleTheme" 
@@ -577,7 +835,10 @@ onUnmounted(() => {
 
       <!-- 统计信息 -->
       <div v-if="entries.length > 0" class="stats">
-        共 {{ entries.length }} 张图片
+        已加载 {{ entries.length }} 张图片
+      </div>
+      <div v-if="batchMode" class="batch-tip">
+        已选择 {{ selectedCount }} 张，点击图片可选择/取消选择
       </div>
 
       <!-- 瀑布流网格（左右优先） -->
@@ -591,10 +852,20 @@ onUnmounted(() => {
             v-for="entry in column" 
             :key="entry.id" 
             class="masonry-item card"
-            @click="open(entry)"
+            :class="{ 'is-selected': batchMode && isEntrySelected(entry.id) }"
+            @click="batchMode ? toggleEntrySelection(entry.id) : open(entry)"
           >
             <!-- 图片容器 -->
             <div class="image-container">
+              <button
+                v-if="batchMode"
+                class="select-btn"
+                :class="{ selected: isEntrySelected(entry.id) }"
+                @click.stop="toggleEntrySelection(entry.id)"
+                :title="isEntrySelected(entry.id) ? '取消选择' : '选择该图片'"
+              >
+                {{ isEntrySelected(entry.id) ? '✓' : '' }}
+              </button>
               <img 
                 v-if="entry.src" 
                 :src="entry.src" 
@@ -638,6 +909,19 @@ onUnmounted(() => {
           </div>
         </div>
       </div>
+
+      <div v-if="!loading && entries.length > 0" class="load-more-status">
+        <span v-if="loadingMore">正在加载更多图片...</span>
+        <span v-else-if="hasMore">下滑自动加载更多图片</span>
+        <span v-else>已加载全部图片</span>
+      </div>
+
+      <div
+        ref="loadMoreAnchor"
+        class="load-more-anchor"
+        v-show="!loading && hasMore && entries.length > 0"
+        aria-hidden="true"
+      ></div>
 
       <!-- 空状态 -->
       <div v-if="!loading && entries.length === 0" class="text-center py-5">
@@ -756,6 +1040,24 @@ onUnmounted(() => {
   font-size: 0.875rem;
 }
 
+.batch-tip {
+  margin-bottom: 1rem;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.load-more-status {
+  margin: 1.25rem 0 0.75rem;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.load-more-anchor {
+  width: 100%;
+  height: 1px;
+}
+
 /* 瀑布流网格 */
 .masonry-grid {
   display: flex;
@@ -780,6 +1082,10 @@ onUnmounted(() => {
   box-shadow: var(--shadow-lg);
 }
 
+.masonry-item.is-selected {
+  box-shadow: 0 0 0 2px var(--primary), var(--shadow-lg);
+}
+
 /* 图片容器 */
 .image-container {
   position: relative;
@@ -798,6 +1104,31 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.select-btn {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
+
+.select-btn.selected {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
 }
 
 /* 刷新按钮 */
@@ -855,6 +1186,7 @@ onUnmounted(() => {
 .modal-body { padding: 1rem 1.25rem; color: var(--text-primary); }
 .modal-actions { padding: 0.75rem 1.25rem; display:flex; gap:0.5rem; justify-content:flex-end; }
 .btn-danger { background: #ef4444; color: white; border: none; padding: 0.6rem 1rem; border-radius: 8px; cursor: pointer; }
+.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-secondary { background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border-color); padding: 0.5rem 0.9rem; border-radius: 8px; cursor: pointer; }
 
 /* Top toast */
