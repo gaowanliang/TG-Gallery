@@ -11,9 +11,8 @@ const emit = defineEmits(['login']);
 // Turnstile 配置 - 需要在环境变量或配置中设置
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY || '1x00000000000000000000AA'; // 测试用的 site key
 
-onMounted(() => {
-  // 初始化 Cloudflare Turnstile
-  if (window.turnstile) {
+function renderTurnstile() {
+  if (window.turnstile && document.getElementById('turnstile-container')) {
     turnstileWidgetId.value = window.turnstile.render('#turnstile-container', {
       sitekey: TURNSTILE_SITE_KEY,
       callback: (token) => {
@@ -25,6 +24,16 @@ onMounted(() => {
       theme: 'light',
       size: 'normal',
     });
+  }
+}
+
+onMounted(() => {
+  // 初始化 Cloudflare Turnstile
+  if (window.turnstile) {
+    renderTurnstile();
+  } else {
+    // 如果 turnstile 脚本还没加载完，等待它加载
+    window.onloadTurnstileCallback = renderTurnstile;
   }
 });
 
