@@ -8,7 +8,8 @@
     "dev:vercel": "vercel dev",
     "dev:cf": "npm run build && wrangler pages dev dist",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deploy:cf": "npm run build && wrangler pages deploy dist --project-name tg-gallery --commit-dirty=true"
   },
   "dependencies": {
     "jsonwebtoken": "^9.0.0",
