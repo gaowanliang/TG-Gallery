@@ -9,19 +9,30 @@ function buildUrlFromFilePath(botToken, filePath, useProxy = false) {
   return `${TELEGRAM_OFFICIAL}/file/bot${botToken}/${filePath}`;
 }
 
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  if (req.method === 'OPTIONS') return res.status(200).end();
+export async function onRequest(context) {
+  const { request, env } = context;
+  const url = new URL(request.url);
+  
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  };
 
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const file_id = url.searchParams.get('file_id');
-  if (!file_id) {
-    res.statusCode = 400;
-    return res.end(JSON.stringify({ error: 'file_id required' }));
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
   }
 
-  const MONGO_URI = process.env.MONGO_URI;
-  let botToken = process.env.BOT_TOKEN || null;
+  const file_id = url.searchParams.get('file_id');
+  if (!file_id) {
+    return new Response(JSON.stringify({ error: 'file_id required' }), {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+
+  const MONGO_URI = env.MONGO_URI;
+  let botToken = env.BOT_TOKEN || null;
+  
   if (MONGO_URI) {
     const client = new MongoClient(MONGO_URI);
     try {
@@ -38,11 +49,12 @@ export default async function handler(req, res) {
   }
 
   if (!botToken) {
-    res.statusCode = 500;
-    return res.end(JSON.stringify({ error: 'No bot token available' }));
+    return new Response(JSON.stringify({ error: 'No bot token available' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
   }
 
-  // Try official getFile
   try {
     const resp = await fetch(`${TELEGRAM_OFFICIAL}/bot${botToken}/getFile?file_id=${encodeURIComponent(file_id)}`);
     const data = await resp.json();
@@ -54,20 +66,19 @@ export default async function handler(req, res) {
       const imageResp = await fetch(urlDirect);
       if (imageResp.ok) {
         const contentType = imageResp.headers.get('content-type') || 'image/jpeg';
-        res.setHeader('Content-Type', contentType);
-        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        
-        // 将图片流直接 pipe 到响应中
-        const arrayBuffer = await imageResp.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        return res.end(buffer);
+        return new Response(imageResp.body, {
+          headers: {
+            ...corsHeaders,
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=31536000, immutable'
+          }
+        });
       }
     }
   } catch (e) {
     // fallthrough to proxy
   }
 
-  // Try proxy
   try {
     const resp2 = await fetch(`${TELEGRAM_PROXY}/bot${botToken}/getFile?file_id=${encodeURIComponent(file_id)}`);
     const data2 = await resp2.json();
@@ -79,19 +90,21 @@ export default async function handler(req, res) {
       const imageResp = await fetch(urlDirect);
       if (imageResp.ok) {
         const contentType = imageResp.headers.get('content-type') || 'image/jpeg';
-        res.setHeader('Content-Type', contentType);
-        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        
-        // 将图片流直接 pipe 到响应中
-        const arrayBuffer = await imageResp.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        return res.end(buffer);
+        return new Response(imageResp.body, {
+          headers: {
+            ...corsHeaders,
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=31536000, immutable'
+          }
+        });
       }
     }
   } catch (e) {
     // final fallback
   }
 
-  res.statusCode = 502;
-  return res.end(JSON.stringify({ error: 'Failed to retrieve file URL' }));
+  return new Response(JSON.stringify({ error: 'Failed to retrieve file URL' }), {
+    status: 502,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
 }

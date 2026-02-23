@@ -107,6 +107,7 @@ export default async function handler(req, res) {
         : null;
 
       res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'public, max-age=60'); // 缓存 60 秒
       return res.end(JSON.stringify({
         items,
         hasMore,
@@ -124,6 +125,7 @@ export default async function handler(req, res) {
 
     const out = docs.map(toGalleryItem);
     res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'public, max-age=60'); // 缓存 60 秒
     return res.end(JSON.stringify(out));
   } catch (e) {
     res.statusCode = 500;

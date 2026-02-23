@@ -340,15 +340,11 @@ async function loadEntryImage(entry) {
 
   pendingImageLoads.add(fileId);
   try {
-    const r = await fetch(`/api/fileurl?file_id=${encodeURIComponent(fileId)}`);
-    if (!r.ok) {
-      entry.loading = false;
-      return;
-    }
-    const j = await r.json();
-    entry.src = j.url;
+    // 直接将 src 设置为后端的 fileurl 接口，让浏览器直接请求图片
+    const imageUrl = `/api/fileurl?file_id=${encodeURIComponent(fileId)}`;
+    entry.src = imageUrl;
     entry.loading = false;
-    setImageCache(fileId, j.url);
+    setImageCache(fileId, imageUrl);
   } catch (err) {
     console.error('Failed to load image:', err);
     entry.loading = false;
@@ -497,17 +493,13 @@ async function refreshSingleImage(entry) {
   
   entry.loading = true;
   try {
-    const r = await fetch(
-      `/api/fileurl?file_id=${encodeURIComponent(entry.telegram.file_id)}`
-    );
-    if (!r.ok) throw new Error('Failed to refresh');
-    
-    const j = await r.json();
-    entry.src = j.url;
+    // 直接使用 fileurl 接口作为图片源，并添加时间戳强制刷新
+    const imageUrl = `/api/fileurl?file_id=${encodeURIComponent(entry.telegram.file_id)}&t=${Date.now()}`;
+    entry.src = imageUrl;
     entry.loading = false;
     
     // 更新缓存
-    setImageCache(entry.telegram.file_id, j.url);
+    setImageCache(entry.telegram.file_id, imageUrl);
   } catch (err) {
     console.error('Failed to refresh image:', err);
     entry.loading = false;
